@@ -17,7 +17,7 @@ class BaldinAScatterV2PerfTests : public ppc::util::BaseRunPerfTests<InType, Out
   std::vector<int> send_vec_;
   std::vector<int> recv_vec_;
 
-  const int count_per_proc_ = 1000000;
+  const int count_per_proc_ = 10000000;
 
   bool static IsModeSeq() {
     const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();

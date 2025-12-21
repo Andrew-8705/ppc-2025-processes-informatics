@@ -3,7 +3,7 @@
 #include <mpi.h>
 
 #include <algorithm>
-#include <cstddef>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -17,158 +17,150 @@ BaldinAScatterV2MPI::BaldinAScatterV2MPI(const InType &in) {
 }
 
 bool BaldinAScatterV2MPI::ValidationImpl() {
-  const auto &input = GetInput();
-  int sendcount = input.send_count;
-  int recvcount = input.recv_count;
-  int root = input.root_rank;
-  MPI_Datatype sendtype = input.send_type;
-  MPI_Datatype recvtype = input.recv_type;
+  const auto &args = GetInput();
 
-  if (sendcount <= 0 || sendcount != recvcount || root < 0) {
-    return false;
-  }
-  if (sendtype != recvtype) {
+  bool is_invalid_counts = (args.send_count <= 0) || (args.send_count != args.recv_count);
+  bool is_invalid_root = (args.root_rank < 0);
+
+  if (is_invalid_counts || is_invalid_root) {
     return false;
   }
 
-  auto is_sup_type = [](MPI_Datatype type) -> bool {
-    return (type == MPI_INT || type == MPI_FLOAT || type == MPI_DOUBLE);
-  };
+  if (args.send_type != args.recv_type) {
+    return false;
+  }
 
-  return is_sup_type(sendtype);
+  auto is_supported = [](MPI_Datatype t) { return (t == MPI_INT || t == MPI_FLOAT || t == MPI_DOUBLE); };
+
+  return is_supported(args.send_type);
 }
 
 bool BaldinAScatterV2MPI::PreProcessingImpl() {
-  auto &input = GetInput();
-  int root = input.root_rank;
+  auto &args = GetInput();
+  int comm_size = 0;
+  MPI_Comm_size(args.comm, &comm_size);
 
-  int world_size = 0;
-  MPI_Comm_size(input.comm, &world_size);
-
-  if (root >= world_size) {
-    input.root_rank = root % world_size;
+  if (args.root_rank >= comm_size) {
+    args.root_rank %= comm_size;
   }
 
   return true;
 }
 
 namespace {
-
-MPI_Aint GetDataTypeExtent(MPI_Datatype type) {
-  MPI_Aint lb = 0;
-  MPI_Aint extent = 0;
+size_t get_type_byte_size(MPI_Datatype type) {
+  MPI_Aint lb, extent;
   MPI_Type_get_extent(type, &lb, &extent);
-  return extent;
+  return static_cast<size_t>(extent);
 }
 
-int VirtualToRealRank(int v_rank, int root, int size) {
-  return (v_rank + root) % size;
+int map_virt_to_real(int virt_rank, int root, int size) {
+  return (virt_rank + root) % size;
 }
 
-int CalculateSubtreeSize(int v_dest, int mask, int size) {
-  return std::min(v_dest + mask, size);
+std::vector<uint8_t> prepare_root_data(const void *src, int size, int root, int count, size_t type_size) {
+  size_t chunk_bytes = static_cast<size_t>(count) * type_size;
+  size_t total_bytes = static_cast<size_t>(size) * chunk_bytes;
+
+  std::vector<uint8_t> buffer(total_bytes);
+
+  const uint8_t *src_bytes = static_cast<const uint8_t *>(src);
+  uint8_t *dst_bytes = buffer.data();
+
+  size_t offset = root * chunk_bytes;
+  size_t tail_size = total_bytes - offset;
+
+  std::copy(src_bytes + offset, src_bytes + total_bytes, dst_bytes);
+
+  std::copy(src_bytes, src_bytes + offset, dst_bytes + tail_size);
+
+  return buffer;
 }
 
-int CalculateInitialMask(int size) {
-  int mask = 1;
-  while (mask < size) {
-    mask <<= 1;
+void exec_scatter_cycle(int size, int root, int rank, int count, MPI_Datatype type, size_t type_size, MPI_Comm comm,
+                        const uint8_t *&active_ptr, std::vector<uint8_t> &buffer) {
+  int relative_rank = (rank - root + size) % size;
+
+  int start_stride = 1;
+  while (start_stride < size) {
+    start_stride <<= 1;
   }
-  return mask >> 1;
-}
+  start_stride >>= 1;
 
-void PrepareRootBuffer(const void *sendbuf, int size, int root, int count, MPI_Aint extent, std::vector<char> &buffer) {
-  size_t total_bytes = static_cast<size_t>(size) * count * extent;
-  size_t chunk_bytes = static_cast<size_t>(count) * extent;
+  for (int stride = start_stride; stride > 0; stride >>= 1) {
+    if (relative_rank % stride != 0) {
+      continue;
+    }
 
-  buffer.resize(total_bytes);
+    bool is_sender = (relative_rank % (stride << 1) == 0);
 
-  const char *send_ptr = static_cast<const char *>(sendbuf);
-  char *tmp_ptr = buffer.data();
+    if (is_sender) {
+      int virt_dest = relative_rank + stride;
 
-  size_t first_part_bytes = (size - root) * chunk_bytes;
-  size_t second_part_bytes = root * chunk_bytes;
+      if (virt_dest < size) {
+        int limit = std::min(virt_dest + stride, size);
+        int send_amt = (limit - virt_dest) * count;
 
-  std::memcpy(tmp_ptr, send_ptr + second_part_bytes, first_part_bytes);
-  std::memcpy(tmp_ptr + first_part_bytes, send_ptr, second_part_bytes);
+        size_t byte_shift = static_cast<size_t>(virt_dest - relative_rank) * count * type_size;
+        int real_dest = map_virt_to_real(virt_dest, root, size);
+
+        MPI_Send(active_ptr + byte_shift, send_amt, type, real_dest, 0, comm);
+      }
+    } else {
+      int virt_src = relative_rank - stride;
+      int real_src = map_virt_to_real(virt_src, root, size);
+
+      int limit = std::min(relative_rank + stride, size);
+      int recv_amt = (limit - relative_rank) * count;
+
+      size_t required_bytes = static_cast<size_t>(recv_amt) * type_size;
+      buffer.resize(required_bytes);
+
+      MPI_Recv(buffer.data(), recv_amt, type, real_src, 0, comm, MPI_STATUS_IGNORE);
+
+      active_ptr = buffer.data();
+    }
+  }
 }
 
 }  // namespace
 
 bool BaldinAScatterV2MPI::RunImpl() {
-  auto &input = GetInput();
+  auto &args = GetInput();
 
-  const void *sendbuf = input.src_buffer;
-  int sendcount = input.send_count;
-  MPI_Datatype sendtype = input.send_type;
-  void *recvbuf = input.dst_buffer;
-  int recvcount = input.recv_count;
-  MPI_Datatype recvtype = input.recv_type;
-  int root = input.root_rank;
-  MPI_Comm comm = input.comm;
+  int rank, size;
+  MPI_Comm_rank(args.comm, &rank);
+  MPI_Comm_size(args.comm, &size);
 
-  int rank = 0;
-  int size = 0;
-  MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &size);
+  size_t type_size = get_type_byte_size(args.recv_type);
 
-  MPI_Aint extent = GetDataTypeExtent(rank == root ? sendtype : recvtype);
+  std::vector<uint8_t> internal_buf;
+  const uint8_t *active_data_ptr = nullptr;
 
-  std::vector<char> temp_buffer;
-  const char *curr_buf_ptr = nullptr;
-
-  if (rank == root) {
-    PrepareRootBuffer(sendbuf, size, root, sendcount, extent, temp_buffer);
-    curr_buf_ptr = temp_buffer.data();
+  if (rank == args.root_rank) {
+    internal_buf = prepare_root_data(args.src_buffer, size, args.root_rank, args.recv_count, type_size);
+    active_data_ptr = internal_buf.data();
   }
 
-  int v_rank = (rank - root + size) % size;
-  int mask = CalculateInitialMask(size);
+  exec_scatter_cycle(size, args.root_rank, rank, args.recv_count, args.recv_type, type_size, args.comm, active_data_ptr,
+                     internal_buf);
 
-  while (mask > 0) {
-    if (v_rank % (2 * mask) == 0) {
-      int v_dest = v_rank + mask;
-
-      if (v_dest < size) {
-        int subtree_size = CalculateSubtreeSize(v_dest, mask, size);
-        int count_to_send = (subtree_size - v_dest) * recvcount;
-
-        size_t offset_bytes = static_cast<size_t>(v_dest - v_rank) * recvcount * extent;
-        int real_dest = VirtualToRealRank(v_dest, root, size);
-
-        MPI_Send(curr_buf_ptr + offset_bytes, count_to_send, (rank == root ? sendtype : recvtype), real_dest, 0, comm);
-      }
-    }
-
-    else if (v_rank % (2 * mask) == mask) {
-      int v_source = v_rank - mask;
-      int real_source = VirtualToRealRank(v_source, root, size);
-
-      int subtree_end = CalculateSubtreeSize(v_rank, mask, size);
-      int count_to_recv = (subtree_end - v_rank) * recvcount;
-
-      size_t bytes_to_recv = static_cast<size_t>(count_to_recv) * extent;
-      temp_buffer.resize(bytes_to_recv);
-
-      MPI_Recv(temp_buffer.data(), count_to_recv, recvtype, real_source, 0, comm, MPI_STATUS_IGNORE);
-
-      curr_buf_ptr = temp_buffer.data();
-    }
-
-    mask >>= 1;
+  if (args.dst_buffer != MPI_IN_PLACE && active_data_ptr != nullptr) {
+    size_t bytes_to_copy = args.recv_count * type_size;
+    uint8_t *user_dst = static_cast<uint8_t *>(args.dst_buffer);
+    std::copy(active_data_ptr, active_data_ptr + bytes_to_copy, user_dst);
   }
 
-  if (recvbuf != MPI_IN_PLACE && curr_buf_ptr != nullptr) {
-    std::memcpy(recvbuf, curr_buf_ptr, recvcount * extent);
+  size_t result_bytes = args.recv_count * type_size;
+  std::vector<uint8_t> result(result_bytes);
+
+  const void *final_src = (args.dst_buffer != nullptr) ? args.dst_buffer : active_data_ptr;
+  if (final_src) {
+    const uint8_t *ptr = static_cast<const uint8_t *>(final_src);
+    std::copy(ptr, ptr + result_bytes, result.begin());
   }
 
-  size_t out_bytes = static_cast<size_t>(recvcount) * extent;
-  std::vector<uint8_t> output_vec(out_bytes);
-  if (recvbuf != nullptr) {
-    std::memcpy(output_vec.data(), recvbuf, out_bytes);
-  }
-
-  GetOutput() = std::move(output_vec);
+  GetOutput() = std::move(result);
   return true;
 }
 
