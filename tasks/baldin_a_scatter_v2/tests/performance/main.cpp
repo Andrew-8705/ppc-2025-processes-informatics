@@ -2,6 +2,7 @@
 #include <mpi.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -13,7 +14,7 @@
 namespace baldin_a_scatter_v2 {
 
 class BaldinAScatterV2PerfTests : public ppc::util::BaseRunPerfTests<InType, OutType> {
-  InType input_data_;
+  InType input_data_{};
   std::vector<int> send_vec_;
   std::vector<int> recv_vec_;
 
@@ -46,7 +47,7 @@ class BaldinAScatterV2PerfTests : public ppc::util::BaseRunPerfTests<InType, Out
       send_vec_.resize(total_send_count);
       // Заполняем данными: i -> i * 5 - 13
       for (size_t i = 0; i < total_send_count; i++) {
-        send_vec_[i] = static_cast<int>(i * 5 - 13);
+        send_vec_[i] = static_cast<int>((i * 5) - 13);
       }
     }
 
@@ -74,7 +75,7 @@ class BaldinAScatterV2PerfTests : public ppc::util::BaseRunPerfTests<InType, Out
     }
 
     if (input_data_.send_type == MPI_INT) {
-      long long base_global_index = static_cast<long long>(rank) * count_per_proc_;
+      int64_t base_global_index = static_cast<int64_t>(rank) * count_per_proc_;
 
       const int *actual_data = reinterpret_cast<const int *>(output_data.data());
 
@@ -83,7 +84,7 @@ class BaldinAScatterV2PerfTests : public ppc::util::BaseRunPerfTests<InType, Out
       }
 
       for (int i = 0; i < count_per_proc_; ++i) {
-        int expected_val = static_cast<int>((base_global_index + i) * 5 - 13);
+        int expected_val = static_cast<int>(((base_global_index + i) * 5) - 13);
         if (actual_data[i] != expected_val) {
           return false;
         }

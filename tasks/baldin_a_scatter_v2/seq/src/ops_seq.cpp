@@ -3,6 +3,9 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "baldin_a_scatter_v2/common/include/common.hpp"
@@ -50,10 +53,10 @@ bool BaldinAScatterV2SEQ::RunImpl() {
     elem_size = sizeof(double);
   }
 
-  size_t total_bytes = static_cast<size_t>(args.send_count) * elem_size;
+  auto total_bytes = static_cast<size_t>(args.send_count) * elem_size;
 
-  const uint8_t *start_ptr = static_cast<const uint8_t *>(args.src_buffer);
-  const uint8_t *end_ptr = start_ptr + total_bytes;
+  const auto *start_ptr = static_cast<const uint8_t *>(args.src_buffer);
+  const auto *end_ptr = start_ptr + total_bytes;
 
   std::vector<uint8_t> source_data(start_ptr, end_ptr);
 
@@ -61,8 +64,8 @@ bool BaldinAScatterV2SEQ::RunImpl() {
   output_data = source_data;
 
   if (args.dst_buffer != nullptr) {
-    uint8_t *dst_ptr = static_cast<uint8_t *>(args.dst_buffer);
-    std::copy(output_data.begin(), output_data.end(), dst_ptr);
+    auto *dst_ptr = static_cast<uint8_t *>(args.dst_buffer);
+    std::ranges::copy(output_data, dst_ptr);
   }
 
   GetOutput() = std::move(output_data);
